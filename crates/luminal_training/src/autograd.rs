@@ -198,16 +198,21 @@ fn add_grad(
     }
     grad.shape.indexes = new_indexes;
 
-    // Undo expands (sum reduce)
-    for i in fwd.shape.indexes.into_iter().rev() {
-        if fwd.shape.fake[i] {
-            grad.id = graph
-                .add_op(SumReduce(i))
-                .input(grad.id, 0, grad.shape)
-                .finish();
-            grad.shape.remove_dim(i);
-            grad.shape = grad.shape.contiguous();
-        }
+    // Undo expands (sum-reduce on every fake dimension)
+    let mut fake_dims: Vec<usize> =
+        (0..fwd.shape.len()).filter(|&idx| fwd.shape.fake[idx]).collect();
+
+    // Remove highest indices first so later indices stay valid.
+    fake_dims.sort_unstable_by(|a, b| b.cmp(a));
+
+    for idx in fake_dims {
+        grad.id = graph
+            .add_op(SumReduce(idx))
+            .input(grad.id, 0, grad.shape)
+            .finish();
+
+        grad.shape.remove_dim(idx);
+        grad.shape = grad.shape.contiguous();
     }
 
     // Check to see if a reshape was done here. If so, we may need to assert grad shape is contiguous or insert a contiguous call
