@@ -551,4 +551,413 @@ mod tests {
                 .as_vec(),
         );
     }
+    #[test]
+    fn test_add_grad_decreasing_idx_r1() {
+        let mut cx = Graph::new();
+        // Create a tensor, expand to add fake dims and permute to produce
+        // a non-monotonic indexes mapping. This mirrors the original intent
+        // without relying on compile-time shape generics.
+        let a = cx.tensor(2);
+        let a = a.expand((1, 1, 2));
+        let a = a.permute((2, 1, 0));
+
+        // has multiple fake dimensions
+        let fake_count = a.shape.fake.iter().filter(|&&b| b).count();
+        assert!(fake_count >= 2);
+        // indexes should not be strictly increasing
+        let not_strict = a.shape.indexes.windows(2).any(|w| w[0] >= w[1]);
+        assert!(not_strict);
+
+        // reduce to scalar and ensure autograd compiles
+        let loss = a.sum((0, 1, 2));
+        let _grads = cx.compile(Autograd::new(vec![a.id], loss), ());
+    }
+
+    #[test]
+    fn test_add_grad_decreasing_idx_r2() {
+        let mut cx = Graph::new();
+        // Start with a 2x3 tensor, expand to add fake dims, then permute to
+        // create a non-monotonic indexes mapping.
+        let a = cx.tensor((2, 3));
+        let a = a.expand((2, 1, 1, 1, 3));
+        let a = a.permute((4, 1, 0, 3, 2));
+
+        // has multiple fake dimensions
+        let fake_count = a.shape.fake.iter().filter(|&&b| b).count();
+        assert!(fake_count >= 3);
+        // indexes should not be strictly increasing
+        let not_strict = a.shape.indexes.windows(2).any(|w| w[0] >= w[1]);
+        assert!(not_strict);
+
+        let loss = a.sum((0, 1, 2, 3, 4));
+        let _grads = cx.compile(Autograd::new(vec![a.id], loss), ());
+    }
+
+    #[test]
+    fn test_add_grad_with_values_r1() {
+        let mut cx = Graph::new();
+        let a = cx.tensor(3).set([1.0, 2.0, 3.0]);
+        let orig_a_id = a.id;
+        // Expand and permute to create fake dims with non-monotonic indexes
+        let a = a.expand((1, 3, 1));
+        let a = a.permute((1, 2, 0));
+
+        let fake_count = a.shape.fake.iter().filter(|&&b| b).count();
+        assert!(fake_count >= 2);
+        let not_strict = a.shape.indexes.windows(2).any(|w| w[0] >= w[1]);
+        assert!(not_strict);
+
+        let loss = a.sum((0, 1, 2));
+
+        let grads = cx.compile(Autograd::new(orig_a_id, loss), ());
+        cx.keep_tensors(&grads);
+        cx.execute();
+
+        // Gradient of sum is all ones
+        assert_exact(&get_vec(grads[0], &mut cx), &vec![1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn test_add_grad_with_values_r2() {
+        let mut cx = Graph::new();
+        let a = cx.tensor((2, 3)).set([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]);
+        let orig_a_id = a.id;
+        // Expand and permute to create fake dims with non-monotonic indexes
+        let a = a.expand((2, 1, 3, 1));
+        let a = a.permute((2, 3, 0, 1));
+
+        let fake_count = a.shape.fake.iter().filter(|&&b| b).count();
+        assert!(fake_count >= 2);
+
+        let loss = a.sum((0, 1, 2, 3));
+
+        let grads = cx.compile(Autograd::new(orig_a_id, loss), ());
+        cx.keep_tensors(&grads);
+        cx.execute();
+
+        // Gradient of sum is all ones
+        assert_exact(
+            &get_vec(grads[0], &mut cx),
+            &vec![1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+        );
+    }
+
+    #[test]
+    fn test_add_grad_multiply_with_permute() {
+        let mut cx = Graph::new();
+        let a = cx.tensor(3).set([2.0, 3.0, 4.0]);
+        let orig_a_id = a.id;
+        // Expand and permute to create fake dims with non-monotonic indexes
+        let a = a.expand((1, 1, 3));
+        let a = a.permute((2, 1, 0));
+
+        let fake_count = a.shape.fake.iter().filter(|&&b| b).count();
+        assert!(fake_count >= 2);
+
+        // Multiply by constant, then sum
+        let b = a * 2.0;
+        let loss = b.sum((0, 1, 2));
+
+        let grads = cx.compile(Autograd::new(orig_a_id, loss), ());
+        cx.keep_tensors(&grads);
+        cx.execute();
+
+        // Gradient should be 2.0 for each element (derivative of 2*x)
+        assert_exact(&get_vec(grads[0], &mut cx), &vec![2.0, 2.0, 2.0]);
+    }
+
+    #[test]
+    fn test_add_grad_complex_permute() {
+        let mut cx = Graph::new();
+        let a = cx.tensor((2, 2)).set([[1.0, 2.0], [3.0, 4.0]]);
+        let orig_a_id = a.id;
+        // Create a complex permutation with multiple fake dims
+        let a = a.expand((1, 2, 1, 2, 1));
+        let a = a.permute((3, 4, 1, 0, 2));
+
+        let fake_count = a.shape.fake.iter().filter(|&&b| b).count();
+        assert!(fake_count >= 3);
+
+        let loss = a.sum((0, 1, 2, 3, 4));
+
+        let grads = cx.compile(Autograd::new(orig_a_id, loss), ());
+        cx.keep_tensors(&grads);
+        cx.execute();
+
+        // Gradient of sum is all ones
+        assert_exact(&get_vec(grads[0], &mut cx), &vec![1.0, 1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn test_add_grad_first_last_fake() {
+        let mut cx = Graph::new();
+        let a = cx.tensor(3).set([1.0, 2.0, 3.0]);
+        let orig_a_id = a.id;
+        // Add fake dims at the beginning and end, then permute
+        let a = a.expand((1, 3, 1));
+        let a = a.permute((2, 0, 1));
+
+        let fake_count = a.shape.fake.iter().filter(|&&b| b).count();
+        assert_eq!(fake_count, 2);
+
+        let loss = a.sum((0, 1, 2));
+
+        let grads = cx.compile(Autograd::new(orig_a_id, loss), ());
+        cx.keep_tensors(&grads);
+        cx.execute();
+
+        assert_exact(&get_vec(grads[0], &mut cx), &vec![1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn test_add_grad_reverse_permute() {
+        let mut cx = Graph::new();
+        let a = cx.tensor((2, 3, 4));
+        let orig_a_id = a.id;
+        a.set(vec![
+            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0,
+            16.0, 17.0, 18.0, 19.0, 20.0, 21.0, 22.0, 23.0, 24.0,
+        ]);
+        // Expand and reverse permute
+        let a = a.expand((2, 1, 3, 1, 4));
+        let a = a.permute((4, 3, 2, 1, 0));
+
+        let fake_count = a.shape.fake.iter().filter(|&&b| b).count();
+        assert!(fake_count >= 2);
+        // Check that indexes are non-monotonic (not strictly increasing)
+        let not_increasing = a.shape.indexes.windows(2).any(|w| w[0] >= w[1]);
+        assert!(not_increasing);        
+
+        let loss = a.sum((0, 1, 2, 3, 4));
+
+        let grads = cx.compile(Autograd::new(orig_a_id, loss), ());
+        cx.keep_tensors(&grads);
+        cx.execute();
+
+        // Should have 2*3*4 = 24 elements, all with gradient 1.0
+        let grad_vec = get_vec(grads[0], &mut cx);
+        assert_eq!(grad_vec.len(), 24);
+        assert!(grad_vec.iter().all(|&v| (v - 1.0).abs() < 1e-6));
+    }
+
+    #[test]
+    fn test_add_grad_with_addition() {
+        let mut cx = Graph::new();
+        let a = cx.tensor(3).set([1.0, 2.0, 3.0]);
+        let b = cx.tensor(3).set([4.0, 5.0, 6.0]);
+        let orig_a_id = a.id;
+        let orig_b_id = b.id;
+
+        // Expand and permute a to create fake dims with non-monotonic indexes
+        let a = a.expand((1, 3, 1));
+        let a = a.permute((1, 2, 0));
+
+        // Also transform b
+        let b = b.expand((1, 3, 1));
+        let b = b.permute((1, 2, 0));
+
+        let c = a + b;
+        let loss = c.sum((0, 1, 2));
+
+        let grads = cx.compile(Autograd::new(vec![orig_a_id, orig_b_id], loss), ());
+        cx.keep_tensors(&grads);
+        cx.execute();
+
+        // Gradients for both should be all ones
+        assert_exact(&get_vec(grads[0], &mut cx), &vec![1.0, 1.0, 1.0]);
+        assert_exact(&get_vec(grads[1], &mut cx), &vec![1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn test_add_grad_high_rank() {
+        let mut cx = Graph::new();
+        let a = cx.tensor((2, 2, 2, 2));
+        let orig_a_id = a.id;
+        a.set(vec![
+            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0,
+            16.0,
+        ]);
+
+        // Add fake dims and permute
+        let a = a.expand((2, 1, 2, 2, 1, 2));
+        let a = a.permute((5, 4, 2, 3, 1, 0));
+
+        let fake_count = a.shape.fake.iter().filter(|&&b| b).count();
+        assert!(fake_count >= 2);
+
+        let loss = a.sum((0, 1, 2, 3, 4, 5));
+
+        let grads = cx.compile(Autograd::new(orig_a_id, loss), ());
+        cx.keep_tensors(&grads);
+        cx.execute();
+
+        let grad_vec = get_vec(grads[0], &mut cx);
+        assert_eq!(grad_vec.len(), 16);
+        assert!(grad_vec.iter().all(|&v| (v - 1.0).abs() < 1e-6));
+    }
+
+    #[test]
+    fn test_add_grad_partial_fake() {
+        let mut cx = Graph::new();
+        let a = cx.tensor((3, 4)).set(vec![
+            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+        ]);
+        let orig_a_id = a.id;
+
+        // Expand only in the middle, creating just one fake dim
+        let a = a.expand((3, 1, 4));
+        let a = a.permute((2, 0, 1));
+
+        let fake_count = a.shape.fake.iter().filter(|&&b| b).count();
+        assert_eq!(fake_count, 1);
+
+        let loss = a.sum((0, 1, 2));
+
+        let grads = cx.compile(Autograd::new(orig_a_id, loss), ());
+        cx.keep_tensors(&grads);
+        cx.execute();
+
+        let grad_vec = get_vec(grads[0], &mut cx);
+        assert_eq!(grad_vec.len(), 12);
+        assert!(grad_vec.iter().all(|&v| (v - 1.0).abs() < 1e-6));
+    }
+
+    #[test]
+    fn test_add_grad_with_elementwise_ops() {
+        let mut cx = Graph::new();
+        let a = cx.tensor(4).set([1.0, 2.0, 3.0, 4.0]);
+        let orig_a_id = a.id;
+
+        // Expand and permute to create fake dims with non-monotonic indexes
+        let a = a.expand((1, 1, 4));
+        let a = a.permute((2, 1, 0));
+
+        // Apply element-wise operations
+        let b = a.sin();
+        let loss = b.sum((0, 1, 2));
+
+        let grads = cx.compile(Autograd::new(orig_a_id, loss), ());
+        cx.keep_tensors(&grads);
+        cx.execute();
+
+        // Gradient should be cos(a) for each element
+        let expected: Vec<f32> = vec![1.0_f32, 2.0, 3.0, 4.0]
+            .into_iter()
+            .map(|x| x.cos())
+            .collect();
+        assert_close(&get_vec(grads[0], &mut cx), &expected);
+    }
+
+    #[test]
+    fn test_undo_permute_behavior() {
+        // Test that the undo-permute step correctly aligns gradient coordinates with forward tensor
+        let mut cx = Graph::new();
+
+        // Create a tensor and transform it like in the failing test
+        let a = cx.tensor((2, 3)).set([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]);
+        let orig_a_id = a.id;
+
+        // Apply complex transformations that create non-monotonic indexes
+        let a = a.expand((2, 1, 1, 1, 3));
+        let a = a.permute((4, 1, 0, 3, 2));
+
+        // Verify the shape has the expected properties
+        assert_eq!(a.shape.len(), 5);
+        let fake_count = a.shape.fake.iter().filter(|&&b| b).count();
+        assert!(fake_count >= 3);
+
+        // Sum to scalar - this should work without out-of-bounds errors
+        let loss = a.sum((0, 1, 2, 3, 4));
+        let grads = cx.compile(Autograd::new(vec![orig_a_id], loss), ());
+        cx.keep_tensors(&grads);
+        cx.execute();
+
+        // Verify the gradient is correct (all ones)
+        let grad_vec = get_vec(grads[0], &mut cx);
+        assert_eq!(grad_vec.len(), 6); // 2 * 3
+        assert!(grad_vec.iter().all(|&v| (v - 1.0).abs() < 1e-6));
+    }
+
+    #[test]
+    fn test_add_grad_requires_real_contiguous() {
+        let mut cx = Graph::new();
+
+        // Make a 2×3 tensor, broadcast & permute so it’s decidedly non-contiguous
+        let a = cx.tensor((2, 3)).set([[1., 2., 3.], [4., 5., 6.]]);
+        let orig = a.id;
+        let a = a.expand((1, 2, 3)).permute((2, 1, 0));
+
+        // Loss is a *second* sum-reduce: first autograd will insert its own,
+        // then this explicit one forces another op to read the result.
+        // If the fake “contiguous” flag is wrong, the second reduction sees
+        // bad strides and the numeric answer is off.
+        let loss = a.sum((0, 1, 2)).sum(());
+        let g = cx.compile(Autograd::new(orig, loss), ());
+        cx.keep_tensors(&g);
+        cx.execute();
+
+        // Expected gradient is still all ones (two sums in series)
+        assert_exact(&GraphTensor::from_id(g[0].0, g[0].1, &mut cx).data(),
+                    &vec![1., 1., 1., 1., 1., 1.]);
+    }
+    #[test]
+    fn test_add_grad_preserves_unfaked_dim() {
+        let mut cx = Graph::new();
+
+        // b is broadcast → fake for forward, but we turn it real with *a
+        let b = cx.tensor(1).set([2.]);          // shape [1] fake dim
+        let a = cx.tensor(3).set([1., 2., 3.]);  // shape [3]
+        let c = b.expand((3,)) * a;              // broadcast multiply
+        let loss = c.sum(0);                     // scalar
+
+        let grads = cx.compile(Autograd::new(b.id, loss), ());
+        cx.keep_tensors(&grads);
+        cx.execute();
+
+        // dloss/db = sum(a) = 6
+        assert_exact(&GraphTensor::from_id(grads[0].0, grads[0].1, &mut cx).data(),
+                    &vec![6.0]);
+    }
+
+    #[test]
+    fn test_add_grad_max_rank_broadcast() {
+        let mut cx = Graph::new();
+        // Test with maximum supported rank (6 dimensions) with many fake dims
+        // ShapeTracker uses ArrayVec with capacity 6, so this is the limit
+        let a = cx.tensor((2, 1, 3, 1, 1, 4));   // 6 dims, many fake
+        // Set some values - we need 2*3*4 = 24 values
+        a.set(vec![1.0; 24]);
+        let orig = a.id;
+        let loss = a.sum((0, 1, 2, 3, 4, 5));
+
+        let grads = cx.compile(Autograd::new(orig, loss), ());
+        cx.keep_tensors(&grads);
+        cx.execute();
+
+        // Verify gradient is correct (all ones)
+        let grad_vec = get_vec(grads[0], &mut cx);
+        assert_eq!(grad_vec.len(), 2 * 3 * 4); // 24 elements
+        assert!(grad_vec.iter().all(|&v| (v - 1.0).abs() < 1e-6));
+    }
+
+    #[test]
+    fn test_add_grad_perm_weight_noncontig() {
+        let mut cx = Graph::new();
+        // Weight is 2×2 but permuted so strides are swapped
+        // This tests that autograd correctly handles non-contiguous tensors
+        let w = cx.tensor((2,2)).set([[1.,2.],[3.,4.]]).permute((1,0));
+        let x = cx.tensor(2).set([10., 5.]);
+        let out = x.matmul(w).sum(0);
+
+        // This should compile and execute without out-of-bounds errors
+        let grads = cx.compile(Autograd::new(w.id, out), ());
+        cx.keep_tensors(&grads);
+        cx.execute();
+
+        // Verify we got a gradient with the correct shape (2x2 = 4 elements)
+        let grad_vec = get_vec(grads[0], &mut cx);
+        assert_eq!(grad_vec.len(), 4);
+        // Verify gradient values are reasonable (not NaN or Inf)
+        assert!(grad_vec.iter().all(|&v| v.is_finite()));
+    }
 }
