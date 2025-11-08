@@ -197,22 +197,35 @@ fn add_grad(
         new_indexes[fwd.shape.indexes[i]] = grad.shape.indexes[i];
     }
     grad.shape.indexes = new_indexes;
-
-    // Undo expands (sum-reduce on every fake dimension)
-    let mut fake_dims: Vec<usize> =
-        (0..fwd.shape.len()).filter(|&idx| fwd.shape.fake[idx]).collect();
-
-    // Remove highest indices first so later indices stay valid.
-    fake_dims.sort_unstable_by(|a, b| b.cmp(a));
-
-    for idx in fake_dims {
-        grad.id = graph
-            .add_op(SumReduce(idx))
-            .input(grad.id, 0, grad.shape)
-            .finish();
-
-        grad.shape.remove_dim(idx);
-        grad.shape = grad.shape.contiguous();
+    // Undo expands (sum reduce)
+    let mut min_idx_removed: Option<usize> = None;
+    let mut min_idx_removed_amount: Option<usize> = None;
+    // TODO: the rev() may no longer be required
+    for i in fwd.shape.indexes.into_iter().rev() {
+        if fwd.shape.fake[i] {
+            min_idx_removed = if let Some(prev) = min_idx_removed {
+                Some(prev.min(i))
+            } else {
+                Some(i)
+            };
+            let min_idx_removed = min_idx_removed.unwrap_or_default();
+            let i_diff = if i > min_idx_removed {
+                min_idx_removed_amount.unwrap_or_default()
+            } else {
+                0
+            };
+            grad.id = graph
+                .add_op(SumReduce(i - i_diff))
+                .input(grad.id, 0, grad.shape)
+                .finish();
+            grad.shape.remove_dim(i - i_diff);
+            grad.shape = grad.shape.contiguous();
+            min_idx_removed_amount = if let Some(prev) = min_idx_removed_amount {
+                Some(prev + 1)
+            } else {
+                Some(1)
+            };
+        }
     }
 
     // Check to see if a reshape was done here. If so, we may need to assert grad shape is contiguous or insert a contiguous call
@@ -249,6 +262,63 @@ mod tests {
 
     fn get_vec(grad: (NodeIndex, ShapeTracker), cx: &mut Graph) -> Vec<f32> {
         GraphTensor::from_id(grad.0, grad.1, cx).data()
+    }
+
+    #[test]
+    fn test_add_grad_exposes_physical_vs_logical_bug() {
+        let mut cx = Graph::new();
+        // 1. Create a 2x1 tensor
+        let a = cx.tensor((2, 1)).set([[1.0], [2.0]]);
+        let orig_a_id = a.id;
+
+        // 2. Expand to 2x2.
+        // This creates shape:
+        // dims:  [2, 2]
+        // idx:   [0, 1]
+        // fake:  [false, true] (physical axis 1 is fake)
+        let a = a.expand((2, 2));
+
+        // 3. Permute it.
+        // This is the key. The `fwd` tensor `a` now has:
+        // logical shape: [2, 2]
+        // physical dims: [2, 2]
+        // fake:          [false, true]
+        // indexes:       [1, 0] (logical 0 -> physical 1; logical 1 -> physical 0)
+        // Original (Failing):
+        // let a = a.permute((1, 0));
+
+        // Corrected (Assumes Rank 3: Batch, Dim1, Dim2. Swaps the two inner dimensions.)
+        let a = a.permute((0, 2, 1));
+        // 4. Sum to a scalar loss
+        let loss = a.sum((0, 1)); // Sum over logical axes 0 and 1
+
+        // 5. Autograd
+        //
+        // add_grad will be called for the input to `sum`, which is the permuted tensor 'a'.
+        //
+        // BUGGY code will:
+        // 1. Find physical fake axes: {1} (because fake[1] is true)
+        // 2. Call SumReduce(1) (incorrectly using physical axis 1 as logical axis)
+        //
+        // CORRECT code will:
+        // 1. Check logical axis 0:
+        //    - logical 0 -> physical 1 (indexes[0])
+        //    - fake[1] is true. Reduce this logical axis.
+        // 2. Check logical axis 1:
+        //    - logical 1 -> physical 0 (indexes[1])
+        //    - fake[0] is false. Do not reduce.
+        // 3. Call SumReduce(0)
+        //
+        // The buggy code will reduce the wrong dimension.
+        let grads = cx.compile(Autograd::new(orig_a_id, loss), ());
+        cx.keep_tensors(&grads);
+        cx.execute();
+
+        // The correct gradient should be sum-reduced along logical axis 0,
+        // resulting in a shape of [2]. The original tensor 'a' was [2, 1],
+        // so the gradient shape [2] will be reshaped to [2, 1].
+        // The values are [1.0, 1.0] (grad) * 2 (from expand) = [2.0, 2.0]
+        assert_exact(&get_vec(grads[0], &mut cx), &vec![2.0, 2.0]);
     }
 
     #[test]
@@ -365,6 +435,59 @@ mod tests {
         assert_close(&b.data(), &d_b.as_vec());
         let d_grads = d_b.backward();
         assert_close(&get_vec(grads[0], &mut cx), &d_grads.get(&d_a).as_vec());
+    }
+
+    #[test]
+    fn test_add_grad_permuted_broadcast_exposes_bug() {
+        let mut cx = Graph::new();
+        // 1. Create a 1D tensor
+        let a = cx.tensor(2).set([1.0, 2.0]);
+        let orig_a_id = a.id;
+
+        // 2. Expand it, creating a fake physical dim 0
+        // shape={ dims:[1, 2], indexes:[0, 1], fake:[true, false] }
+        let a = a.expand((1, 2));
+
+        // 3. Permute it, swapping logical and physical axes
+        // This is the key. The `fwd` tensor `a` now has:
+        // logical shape: [2, 1]
+        // physical dims: [1, 2]
+        // fake:          [true, false] (physical axis 0 is fake, physical 1 is not)
+        // indexes:       [1, 0]        (logical 0 -> physical 1; logical 1 -> physical 0)
+        let a = a.permute((1, 0));
+
+        // 4. Sum to a scalar loss
+        let loss = a.sum((0, 1)); // Sum over logical axes 0 and 1
+
+        // 5. Autograd
+        //
+        // What happens in add_grad(..., a, ...):
+        //
+        // BUGGY code will:
+        // 1. Find physical fake axes: {0} (because fake[0] is true)
+        // 2. Sort them: [0]
+        // 3. Call SumReduce(0) (treating physical axis 0 as a logical axis)
+        //
+        // CORRECT code will:
+        // 1. Check logical axis 0:
+        //    - logical 0 -> physical 1 (indexes[0])
+        //    - fake[1] is false. Do not reduce.
+        // 2. Check logical axis 1:
+        //    - logical 1 -> physical 0 (indexes[1])
+        //    - fake[0] is true. Reduce this logical axis.
+        // 3. Call SumReduce(1)
+        //
+        // Since the buggy code calls SumReduce(0) and the correct code calls
+        // SumReduce(1), this test will fail on the buggy implementation.
+        let grads = cx.compile(Autograd::new(orig_a_id, loss), ());
+        cx.keep_tensors(&grads);
+        cx.execute();
+
+        // The gradient of sum is 1.0. This should be reduced along the correct
+        // broadcasted dimension (logical axis 1) to produce a gradient of shape [2],
+        // which matches the original tensor 'a'.
+        // The values should be [1.0, 1.0].
+        assert_exact(&get_vec(grads[0], &mut cx), &vec![1.0, 1.0]);
     }
 
     #[test]
@@ -720,8 +843,8 @@ mod tests {
         let a = cx.tensor((2, 3, 4));
         let orig_a_id = a.id;
         a.set(vec![
-            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0,
-            16.0, 17.0, 18.0, 19.0, 20.0, 21.0, 22.0, 23.0, 24.0,
+            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0,
+            17.0, 18.0, 19.0, 20.0, 21.0, 22.0, 23.0, 24.0,
         ]);
         // Expand and reverse permute
         let a = a.expand((2, 1, 3, 1, 4));
@@ -731,7 +854,7 @@ mod tests {
         assert!(fake_count >= 2);
         // Check that indexes are non-monotonic (not strictly increasing)
         let not_increasing = a.shape.indexes.windows(2).any(|w| w[0] >= w[1]);
-        assert!(not_increasing);        
+        assert!(not_increasing);
 
         let loss = a.sum((0, 1, 2, 3, 4));
 
@@ -779,8 +902,7 @@ mod tests {
         let a = cx.tensor((2, 2, 2, 2));
         let orig_a_id = a.id;
         a.set(vec![
-            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0,
-            16.0,
+            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0,
         ]);
 
         // Add fake dims and permute
@@ -902,26 +1024,30 @@ mod tests {
         cx.execute();
 
         // Expected gradient is still all ones (two sums in series)
-        assert_exact(&GraphTensor::from_id(g[0].0, g[0].1, &mut cx).data(),
-                    &vec![1., 1., 1., 1., 1., 1.]);
+        assert_exact(
+            &GraphTensor::from_id(g[0].0, g[0].1, &mut cx).data(),
+            &vec![1., 1., 1., 1., 1., 1.],
+        );
     }
     #[test]
     fn test_add_grad_preserves_unfaked_dim() {
         let mut cx = Graph::new();
 
         // b is broadcast → fake for forward, but we turn it real with *a
-        let b = cx.tensor(1).set([2.]);          // shape [1] fake dim
-        let a = cx.tensor(3).set([1., 2., 3.]);  // shape [3]
-        let c = b.expand((3,)) * a;              // broadcast multiply
-        let loss = c.sum(0);                     // scalar
+        let b = cx.tensor(1).set([2.]); // shape [1] fake dim
+        let a = cx.tensor(3).set([1., 2., 3.]); // shape [3]
+        let c = b.expand((3,)) * a; // broadcast multiply
+        let loss = c.sum(0); // scalar
 
         let grads = cx.compile(Autograd::new(b.id, loss), ());
         cx.keep_tensors(&grads);
         cx.execute();
 
         // dloss/db = sum(a) = 6
-        assert_exact(&GraphTensor::from_id(grads[0].0, grads[0].1, &mut cx).data(),
-                    &vec![6.0]);
+        assert_exact(
+            &GraphTensor::from_id(grads[0].0, grads[0].1, &mut cx).data(),
+            &vec![6.0],
+        );
     }
 
     #[test]
@@ -929,8 +1055,8 @@ mod tests {
         let mut cx = Graph::new();
         // Test with maximum supported rank (6 dimensions) with many fake dims
         // ShapeTracker uses ArrayVec with capacity 6, so this is the limit
-        let a = cx.tensor((2, 1, 3, 1, 1, 4));   // 6 dims, many fake
-        // Set some values - we need 2*3*4 = 24 values
+        let a = cx.tensor((2, 1, 3, 1, 1, 4)); // 6 dims, many fake
+                                               // Set some values - we need 2*3*4 = 24 values
         a.set(vec![1.0; 24]);
         let orig = a.id;
         let loss = a.sum((0, 1, 2, 3, 4, 5));
@@ -950,7 +1076,7 @@ mod tests {
         let mut cx = Graph::new();
         // Weight is 2×2 but permuted so strides are swapped
         // This tests that autograd correctly handles non-contiguous tensors
-        let w = cx.tensor((2,2)).set([[1.,2.],[3.,4.]]).permute((1,0));
+        let w = cx.tensor((2, 2)).set([[1., 2.], [3., 4.]]).permute((1, 0));
         let x = cx.tensor(2).set([10., 5.]);
         let out = x.matmul(w).sum(0);
 
